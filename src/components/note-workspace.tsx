@@ -1,15 +1,27 @@
 'use client'
 
-import { useCallback, useEffect, useMemo, useState, type DragEvent, type FormEvent } from 'react'
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ChangeEvent,
+  type DragEvent,
+  type FormEvent,
+} from 'react'
 import { useRouter } from 'next/navigation'
 import type { Session } from '@supabase/supabase-js'
 import {
   BookOpen,
+  ArchiveRestore,
   Check,
   Clock3,
   Copy,
   Database,
+  Download,
   FileText,
+  FileUp,
   Folder,
   GripVertical,
   Hash,
@@ -25,6 +37,7 @@ import {
   Quote,
   Search,
   Share2,
+  SlidersHorizontal,
   Sparkles,
   Star,
   Tags,
@@ -52,7 +65,10 @@ import {
 import { getSupabaseClient, isSupabaseConfigured, type RemoteNoteRow } from '@/lib/supabase'
 
 const STORAGE_KEY = 'note-atelier-documents-v2'
+const RECENT_KEY = 'note-atelier-recent-v1'
 const DEFAULT_APP_ORIGIN = 'https://note-sigma-jet.vercel.app'
+const TRASH_TAG = '__note_atelier_trash'
+const IMPORT_INPUT_ID = 'markdown-import-input'
 
 type SyncState = 'local' | 'ready' | 'syncing' | 'synced' | 'error'
 
@@ -94,6 +110,18 @@ function sameNoteSet(a: Note[], b: Note[]) {
   return JSON.stringify(a.map((note) => note.id).sort()) === JSON.stringify(b.map((note) => note.id).sort())
 }
 
+function isTrashed(note: Note) {
+  return note.tags.includes(TRASH_TAG)
+}
+
+function visibleTags(note: Note) {
+  return note.tags.filter((tag) => tag !== TRASH_TAG)
+}
+
+function withoutTrashTag(tags: string[]) {
+  return tags.filter((tag) => tag !== TRASH_TAG)
+}
+
 function mapRemoteNote(row: RemoteNoteRow): Note {
   return normalizeNote({
     id: row.id,
@@ -114,7 +142,7 @@ function makeSearchBlob(note: Note) {
     note.title,
     note.summary,
     note.folder,
-    ...note.tags,
+    ...visibleTags(note),
     ...note.blocks.map((block) => block.content),
   ]
     .join(' ')
@@ -122,7 +150,7 @@ function makeSearchBlob(note: Note) {
 }
 
 function firstKeywords(note: Note) {
-  return [note.title, note.summary, note.folder, ...note.tags, ...note.blocks.map((block) => block.content)]
+  return [note.title, note.summary, note.folder, ...visibleTags(note), ...note.blocks.map((block) => block.content)]
     .join(' ')
     .replace(/[^\p{L}\p{N}\s]/gu, ' ')
     .split(/\s+/)
@@ -199,6 +227,96 @@ function getLoginRedirectTo() {
   return DEFAULT_APP_ORIGIN
 }
 
+function escapeMarkdown(value: string) {
+  return value.replaceAll('\\', '\\\\').replaceAll('\n', ' ')
+}
+
+function noteToMarkdown(note: Note) {
+  const metadata = [
+    `<!-- folder: ${escapeMarkdown(note.folder)} -->`,
+    `<!-- tags: ${visibleTags(note).join(', ')} -->`,
+    '',
+  ].join('\n')
+
+  const body = note.blocks
+    .map((block) => {
+      if (block.type === 'heading') {
+        return `## ${block.content}`
+      }
+
+      if (block.type === 'todo') {
+        return `- [${block.checked ? 'x' : ' '}] ${block.content}`
+      }
+
+      if (block.type === 'quote') {
+        return block.content
+          .split('\n')
+          .map((line) => `> ${line}`)
+          .join('\n')
+      }
+
+      return block.content
+    })
+    .join('\n\n')
+
+  return `# ${note.title}\n\n${metadata}${note.summary ? `${note.summary}\n\n` : ''}${body}\n`
+}
+
+function markdownToNote(markdown: string): Note {
+  const lines = markdown.replace(/\r\n/g, '\n').split('\n')
+  const titleLine = lines.find((line) => line.trim().startsWith('# '))
+  const folderMatch = markdown.match(/<!--\s*folder:\s*(.*?)\s*-->/i)
+  const tagsMatch = markdown.match(/<!--\s*tags:\s*(.*?)\s*-->/i)
+  const title = titleLine?.replace(/^#\s+/, '').trim() || 'Imported Page'
+  const blocks: NoteBlock[] = []
+
+  for (const rawLine of lines) {
+    const line = rawLine.trimEnd()
+
+    if (!line.trim() || line.startsWith('<!--') || line.startsWith('# ')) {
+      continue
+    }
+
+    if (line.startsWith('## ')) {
+      blocks.push({ id: crypto.randomUUID(), type: 'heading', content: line.slice(3).trim() })
+    } else if (/^-\s+\[[ xX]\]\s+/.test(line)) {
+      blocks.push({
+        id: crypto.randomUUID(),
+        type: 'todo',
+        content: line.replace(/^-\s+\[[ xX]\]\s+/, '').trim(),
+        checked: /^-\s+\[[xX]\]/.test(line),
+      })
+    } else if (line.startsWith('> ')) {
+      blocks.push({ id: crypto.randomUUID(), type: 'quote', content: line.slice(2).trim() })
+    } else {
+      blocks.push({ id: crypto.randomUUID(), type: 'paragraph', content: line.trim() })
+    }
+  }
+
+  return normalizeNote({
+    id: crypto.randomUUID(),
+    title,
+    icon: 'M',
+    summary: '',
+    favorited: false,
+    folder: folderMatch?.[1]?.trim() || 'Imports',
+    tags: normalizeTags(tagsMatch?.[1] || 'imported'),
+    isPublic: false,
+    updatedAt: new Date().toISOString(),
+    blocks: blocks.length ? blocks : [createBlock('paragraph')],
+  })
+}
+
+function downloadText(filename: string, content: string) {
+  const blob = new Blob([content], { type: 'text/markdown;charset=utf-8' })
+  const url = URL.createObjectURL(blob)
+  const anchor = document.createElement('a')
+  anchor.href = url
+  anchor.download = filename
+  anchor.click()
+  URL.revokeObjectURL(url)
+}
+
 export function NoteWorkspace({
   initialNoteId,
   sharedNoteId,
@@ -224,33 +342,49 @@ export function NoteWorkspace({
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [draggedBlockId, setDraggedBlockId] = useState<string | null>(null)
   const [copiedShare, setCopiedShare] = useState(false)
+  const [recentIds, setRecentIds] = useState<string[]>([])
+  const [showTrash, setShowTrash] = useState(false)
+  const [libraryOpen, setLibraryOpen] = useState(false)
+  const [slashBlockId, setSlashBlockId] = useState<string | null>(null)
+  const importInputRef = useRef<HTMLInputElement | null>(null)
 
   const supabaseReady = isSupabaseConfigured()
   const isShareMode = Boolean(sharedNoteId)
   const activeNote = notes.find((note) => note.id === activeId) ?? notes[0]
 
   const folders = useMemo(
-    () => ['All', ...Array.from(new Set(notes.map((note) => note.folder || 'Inbox'))).sort()],
+    () => ['All', ...Array.from(new Set(notes.filter((note) => !isTrashed(note)).map((note) => note.folder || 'Inbox'))).sort()],
     [notes],
   )
   const tags = useMemo(
-    () => ['All', ...Array.from(new Set(notes.flatMap((note) => note.tags))).sort()],
+    () => ['All', ...Array.from(new Set(notes.filter((note) => !isTrashed(note)).flatMap((note) => visibleTags(note)))).sort()],
     [notes],
+  )
+  const trashedNotes = useMemo(() => notes.filter((note) => isTrashed(note)), [notes])
+  const liveNotes = useMemo(() => notes.filter((note) => !isTrashed(note)), [notes])
+  const recentNotes = useMemo(
+    () =>
+      recentIds
+        .map((id) => notes.find((note) => note.id === id && !isTrashed(note)))
+        .filter((note): note is Note => Boolean(note))
+        .slice(0, 4),
+    [notes, recentIds],
   )
 
   const filteredNotes = useMemo(() => {
     const needle = query.trim().toLowerCase()
-    const sorted = [...notes].sort(
+    const pool = showTrash ? trashedNotes : liveNotes
+    const sorted = [...pool].sort(
       (a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime(),
     )
 
     return sorted.filter((note) => {
       const matchesQuery = !needle || makeSearchBlob(note).includes(needle)
       const matchesFolder = selectedFolder === 'All' || note.folder === selectedFolder
-      const matchesTag = selectedTag === 'All' || note.tags.includes(selectedTag)
+      const matchesTag = selectedTag === 'All' || visibleTags(note).includes(selectedTag)
       return matchesQuery && matchesFolder && matchesTag
     })
-  }, [notes, query, selectedFolder, selectedTag])
+  }, [liveNotes, query, selectedFolder, selectedTag, showTrash, trashedNotes])
 
   const favoriteNotes = filteredNotes.filter((note) => note.favorited)
   const regularNotes = filteredNotes.filter((note) => !note.favorited)
@@ -259,6 +393,14 @@ export function NoteWorkspace({
     (id: string) => {
       setActiveId(id)
       setSidebarOpen(false)
+
+      if (typeof window !== 'undefined' && !isShareMode) {
+        setRecentIds((current) => {
+          const next = [id, ...current.filter((recentId) => recentId !== id)].slice(0, 8)
+          window.localStorage.setItem(RECENT_KEY, JSON.stringify(next))
+          return next
+        })
+      }
 
       if (!isShareMode) {
         router.push(`/note/${id}`, { scroll: false })
@@ -334,12 +476,18 @@ export function NoteWorkspace({
       }
 
       const localNotes = loadLocalNotes()
+      const firstVisibleNote = localNotes.find((note) => !isTrashed(note)) ?? localNotes[0]
       setNotes(localNotes)
       setActiveId(
         initialNoteId && localNotes.some((note) => note.id === initialNoteId)
           ? initialNoteId
-          : localNotes[0]?.id ?? starterNotes[0].id,
+          : firstVisibleNote?.id ?? starterNotes[0].id,
       )
+      try {
+        setRecentIds(JSON.parse(window.localStorage.getItem(RECENT_KEY) || '[]') as string[])
+      } catch {
+        setRecentIds([])
+      }
       setHydrated(true)
     }, 0)
 
@@ -443,21 +591,45 @@ export function NoteWorkspace({
   const addNote = () => {
     const next = createBlankNote()
     setNotes((current) => [next, ...current])
+    setShowTrash(false)
     setActiveNoteId(next.id)
   }
 
-  const deleteActiveNote = async () => {
-    if (!activeNote || notes.length === 1 || isShareMode) {
+  const deleteActiveNote = () => {
+    if (!activeNote || isShareMode) {
       return
     }
 
-    const nextNotes = notes.filter((note) => note.id !== activeNote.id)
-    setNotes(nextNotes)
-    setActiveNoteId(nextNotes[0].id)
+    updateNote(activeNote.id, (note) => ({
+      ...note,
+      favorited: false,
+      tags: Array.from(new Set([...note.tags, TRASH_TAG])),
+    }))
+
+    const nextNote = liveNotes.find((note) => note.id !== activeNote.id) ?? notes.find((note) => note.id !== activeNote.id)
+    if (nextNote) {
+      setActiveNoteId(nextNote.id)
+    }
+  }
+
+  const restoreNote = (noteId: string) => {
+    updateNote(noteId, (note) => ({
+      ...note,
+      tags: withoutTrashTag(note.tags),
+    }))
+    setShowTrash(false)
+    setActiveNoteId(noteId)
+  }
+
+  const permanentlyDeleteNote = async (noteId: string) => {
+    const nextNotes = notes.filter((note) => note.id !== noteId)
+    const fallbackNote = nextNotes.find((note) => !isTrashed(note)) ?? nextNotes[0] ?? createBlankNote()
+    setNotes(nextNotes.length ? nextNotes : [fallbackNote])
+    setActiveNoteId(fallbackNote.id)
 
     if (session && supabaseReady) {
       const client = getSupabaseClient()
-      await client?.from('notes').delete().eq('id', activeNote.id).eq('user_id', session.user.id)
+      await client?.from('notes').delete().eq('id', noteId).eq('user_id', session.user.id)
     }
   }
 
@@ -480,6 +652,7 @@ export function NoteWorkspace({
 
   const updateBlockContent = (block: NoteBlock, content: string) => {
     const transformed = markdownTransform(content, block.type)
+    setSlashBlockId(content === '/' && block.type === 'paragraph' ? block.id : null)
     updateBlock(block.id, transformed ?? { content })
   }
 
@@ -488,6 +661,15 @@ export function NoteWorkspace({
       ...note,
       blocks: [...note.blocks, createBlock(type)],
     }))
+  }
+
+  const convertBlock = (blockId: string, type: BlockType) => {
+    updateBlock(blockId, {
+      type,
+      content: type === 'heading' ? 'New section' : '',
+      checked: type === 'todo' ? false : undefined,
+    })
+    setSlashBlockId(null)
   }
 
   const moveBlock = (targetId: string) => {
@@ -580,6 +762,68 @@ export function NoteWorkspace({
     setRemoteReady(true)
   }
 
+  const exportActiveNote = () => {
+    if (!activeNote || typeof window === 'undefined') {
+      return
+    }
+
+    const filename = `${activeNote.title || 'note'}`.replace(/[^\p{L}\p{N}-]+/gu, '-').replace(/^-|-$/g, '') || 'note'
+    downloadText(`${filename}.md`, noteToMarkdown(activeNote))
+  }
+
+  const importMarkdown = async (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0]
+
+    if (!file) {
+      return
+    }
+
+    const content = await file.text()
+    const next = markdownToNote(content)
+    setNotes((current) => [next, ...current])
+    setShowTrash(false)
+    setActiveNoteId(next.id)
+    event.target.value = ''
+  }
+
+  const renameFolder = (folder: string) => {
+    const nextName = window.prompt('Rename folder', folder)?.trim()
+
+    if (!nextName || nextName === folder) {
+      return
+    }
+
+    setNotes((current) =>
+      current.map((note) =>
+        note.folder === folder
+          ? { ...note, folder: nextName, updatedAt: new Date().toISOString() }
+          : note,
+      ),
+    )
+    setSelectedFolder(nextName)
+  }
+
+  const renameTag = (tag: string) => {
+    const nextName = window.prompt('Rename tag', tag)?.trim()
+
+    if (!nextName || nextName === tag) {
+      return
+    }
+
+    setNotes((current) =>
+      current.map((note) =>
+        note.tags.includes(tag)
+          ? {
+              ...note,
+              tags: Array.from(new Set(note.tags.map((item) => (item === tag ? nextName : item)))),
+              updatedAt: new Date().toISOString(),
+            }
+          : note,
+      ),
+    )
+    setSelectedTag(nextName)
+  }
+
   const syncCopy = {
     local: {
       label: 'Local only',
@@ -620,12 +864,13 @@ export function NoteWorkspace({
   }
 
   const keywords = firstKeywords(activeNote)
+  const activeIsTrashed = isTrashed(activeNote)
   const wordCount = countWords(activeNote)
   const todoCount = activeNote.blocks.filter((block) => block.type === 'todo').length
   const doneCount = activeNote.blocks.filter((block) => block.type === 'todo' && block.checked).length
 
   return (
-    <main className={`workspace-shell ${sidebarOpen ? 'sidebar-open' : ''} ${isShareMode ? 'share-mode' : ''}`}>
+    <main className={`workspace-shell ${sidebarOpen ? 'sidebar-open' : ''} ${isShareMode ? 'share-mode' : ''} ${showTrash ? 'trash-open' : ''}`}>
       <div className="mobile-topbar">
         <button
           type="button"
@@ -699,6 +944,18 @@ export function NoteWorkspace({
               <Plus size={16} />
               New page
             </button>
+
+            <div className="quick-rail">
+              <button type="button" className={showTrash ? 'active' : ''} onClick={() => setShowTrash((open) => !open)}>
+                <Trash2 size={14} />
+                Trash
+                <span>{trashedNotes.length}</span>
+              </button>
+              <button type="button" onClick={() => setLibraryOpen((open) => !open)}>
+                <SlidersHorizontal size={14} />
+                Library
+              </button>
+            </div>
           </>
         )}
 
@@ -718,22 +975,43 @@ export function NoteWorkspace({
 
         <section className="rail-section">
           <div className="rail-section-title">
-            <span>{isShareMode ? 'Shared' : 'Favorites'}</span>
-            <Star size={13} />
+            <span>{isShareMode ? 'Shared' : showTrash ? 'Trash' : 'Favorites'}</span>
+            {showTrash ? <Trash2 size={13} /> : <Star size={13} />}
           </div>
           <div className="doc-list">
-            {(isShareMode ? notes : favoriteNotes).map((note) => (
+            {(isShareMode ? notes : showTrash ? trashedNotes : favoriteNotes).map((note) => (
               <DocumentRow
                 key={note.id}
                 note={note}
                 active={note.id === activeNote.id}
+                query={query}
                 onClick={() => setActiveNoteId(note.id)}
               />
             ))}
           </div>
         </section>
 
-        {!isShareMode && (
+        {!isShareMode && !showTrash && !query.trim() && selectedFolder === 'All' && selectedTag === 'All' && recentNotes.length > 0 && (
+          <section className="rail-section">
+            <div className="rail-section-title">
+              <span>Recent</span>
+              <Clock3 size={13} />
+            </div>
+            <div className="doc-list">
+              {recentNotes.map((note) => (
+                <DocumentRow
+                  key={note.id}
+                  note={note}
+                  active={note.id === activeNote.id}
+                  query={query}
+                  onClick={() => setActiveNoteId(note.id)}
+                />
+              ))}
+            </div>
+          </section>
+        )}
+
+        {!isShareMode && !showTrash && (
           <section className="rail-section">
             <div className="rail-section-title">
               <span>Workspace</span>
@@ -745,6 +1023,7 @@ export function NoteWorkspace({
                   key={note.id}
                   note={note}
                   active={note.id === activeNote.id}
+                  query={query}
                   onClick={() => setActiveNoteId(note.id)}
                 />
               ))}
@@ -844,9 +1123,24 @@ export function NoteWorkspace({
                 <button type="button" className="editor-action" title="New page" onClick={addNote}>
                   <Plus size={17} />
                 </button>
+                <button type="button" className="editor-action" title="Import markdown" onClick={() => importInputRef.current?.click()}>
+                  <FileUp size={17} />
+                </button>
+                <button type="button" className="editor-action" title="Export markdown" onClick={exportActiveNote}>
+                  <Download size={17} />
+                </button>
               </div>
             )}
           </div>
+
+          <input
+            ref={importInputRef}
+            id={IMPORT_INPUT_ID}
+            className="hidden-file-input"
+            type="file"
+            accept=".md,.markdown,text/markdown,text/plain"
+            onChange={importMarkdown}
+          />
 
           {activeNote.isPublic && !isShareMode && (
             <div className="share-strip">
@@ -873,7 +1167,7 @@ export function NoteWorkspace({
               value={activeNote.icon}
               maxLength={2}
               aria-label="Page icon"
-              readOnly={isShareMode}
+              readOnly={isShareMode || activeIsTrashed}
               onChange={(event) =>
                 updateActiveNote((note) => ({ ...note, icon: event.target.value || 'P' }))
               }
@@ -882,7 +1176,7 @@ export function NoteWorkspace({
               className="title-input"
               value={activeNote.title}
               aria-label="Page title"
-              readOnly={isShareMode}
+              readOnly={isShareMode || activeIsTrashed}
               onChange={(event) =>
                 updateActiveNote((note) => ({ ...note, title: event.target.value }))
               }
@@ -894,13 +1188,13 @@ export function NoteWorkspace({
             value={activeNote.summary}
             aria-label="Page summary"
             placeholder="Summary"
-            readOnly={isShareMode}
+            readOnly={isShareMode || activeIsTrashed}
             onChange={(event) =>
               updateActiveNote((note) => ({ ...note, summary: event.target.value }))
             }
           />
 
-          {!isShareMode && (
+          {!isShareMode && !activeIsTrashed && (
             <div className="property-grid">
               <label>
                 <span>Folder</span>
@@ -914,17 +1208,17 @@ export function NoteWorkspace({
               <label>
                 <span>Tags</span>
                 <input
-                  value={activeNote.tags.join(', ')}
+                  value={visibleTags(activeNote).join(', ')}
                   placeholder="design, release"
                   onChange={(event) =>
-                    updateActiveNote((note) => ({ ...note, tags: normalizeTags(event.target.value) }))
+                      updateActiveNote((note) => ({ ...note, tags: normalizeTags(event.target.value) }))
                   }
                 />
               </label>
             </div>
           )}
 
-          {!isShareMode && (
+          {!isShareMode && !activeIsTrashed && (
             <div className="toolbar" aria-label="Add block">
               {(['paragraph', 'heading', 'todo', 'quote'] as BlockType[]).map((type) => (
                 <button
@@ -946,8 +1240,9 @@ export function NoteWorkspace({
               <BlockEditor
                 key={block.id}
                 block={block}
-                readonly={isShareMode}
+                readonly={isShareMode || activeIsTrashed}
                 dragged={draggedBlockId === block.id}
+                showSlashMenu={slashBlockId === block.id}
                 onDragStart={() => setDraggedBlockId(block.id)}
                 onDragOver={(event) => {
                   event.preventDefault()
@@ -956,12 +1251,30 @@ export function NoteWorkspace({
                 onDragEnd={() => setDraggedBlockId(null)}
                 onChange={(patch) => updateBlock(block.id, patch)}
                 onContentChange={(content) => updateBlockContent(block, content)}
+                onConvert={(type) => convertBlock(block.id, type)}
                 onDelete={() => deleteBlock(block.id)}
               />
             ))}
           </div>
         </article>
       </section>
+
+      {!isShareMode && !activeIsTrashed && (
+        <div className="mobile-commandbar" aria-label="Mobile actions">
+          <button type="button" title="Text" onClick={() => appendBlock('paragraph')}>
+            <Type size={18} />
+          </button>
+          <button type="button" title="Todo" onClick={() => appendBlock('todo')}>
+            <ListTodo size={18} />
+          </button>
+          <button type="button" title="Import" onClick={() => importInputRef.current?.click()}>
+            <FileUp size={18} />
+          </button>
+          <button type="button" title="Export" onClick={exportActiveNote}>
+            <Download size={18} />
+          </button>
+        </div>
+      )}
 
       <aside className="inspector" aria-label="Document info">
         <section className="right-card">
@@ -990,8 +1303,8 @@ export function NoteWorkspace({
             <Tags size={16} />
           </div>
           <div className="keyword-list">
-            {activeNote.tags.length > 0 ? (
-              activeNote.tags.map((tag, index) => <span key={`${tag}-${index}`}>{tag}</span>)
+            {visibleTags(activeNote).length > 0 ? (
+              visibleTags(activeNote).map((tag, index) => <span key={`${tag}-${index}`}>{tag}</span>)
             ) : (
               <span>untagged</span>
             )}
@@ -1012,21 +1325,70 @@ export function NoteWorkspace({
           </div>
         </section>
 
+        {!isShareMode && libraryOpen && (
+          <section className="right-card library-card">
+            <div className="right-title">
+              <strong>Library</strong>
+              <SlidersHorizontal size={16} />
+            </div>
+            <div className="library-group">
+              <span>Folders</span>
+              <div className="keyword-list">
+                {folders.filter((folder) => folder !== 'All').map((folder) => (
+                  <button key={folder} type="button" onClick={() => setSelectedFolder(folder)} onDoubleClick={() => renameFolder(folder)}>
+                    <Folder size={13} />
+                    {folder}
+                  </button>
+                ))}
+              </div>
+            </div>
+            <div className="library-group">
+              <span>Tags</span>
+              <div className="keyword-list">
+                {tags.filter((tag) => tag !== 'All').map((tag) => (
+                  <button key={tag} type="button" onClick={() => setSelectedTag(tag)} onDoubleClick={() => renameTag(tag)}>
+                    <Tags size={13} />
+                    {tag}
+                  </button>
+                ))}
+              </div>
+            </div>
+          </section>
+        )}
+
         {!isShareMode && (
           <section className="right-card">
             <div className="right-title">
               <strong>Actions</strong>
               <Link2 size={16} />
             </div>
-            <button
-              type="button"
-              className="danger-button"
-              disabled={notes.length === 1}
-              onClick={deleteActiveNote}
-            >
-              <Trash2 size={15} />
-              Delete page
-            </button>
+            {activeIsTrashed ? (
+              <>
+                <button type="button" className="plain-button restore-button" onClick={() => restoreNote(activeNote.id)}>
+                  <ArchiveRestore size={15} />
+                  Restore page
+                </button>
+                <button type="button" className="danger-button" onClick={() => permanentlyDeleteNote(activeNote.id)}>
+                  <Trash2 size={15} />
+                  Delete forever
+                </button>
+              </>
+            ) : (
+              <>
+                <button type="button" className="plain-button" onClick={exportActiveNote}>
+                  <Download size={15} />
+                  Export markdown
+                </button>
+                <button type="button" className="plain-button secondary-light" onClick={() => importInputRef.current?.click()}>
+                  <FileUp size={15} />
+                  Import markdown
+                </button>
+                <button type="button" className="danger-button" disabled={liveNotes.length === 1} onClick={deleteActiveNote}>
+                  <Trash2 size={15} />
+                  Move to trash
+                </button>
+              </>
+            )}
           </section>
         )}
       </aside>
@@ -1037,22 +1399,50 @@ export function NoteWorkspace({
 function DocumentRow({
   note,
   active,
+  query,
   onClick,
 }: {
   note: Note
   active: boolean
+  query: string
   onClick: () => void
 }) {
+  const tags = visibleTags(note)
+
   return (
     <button type="button" className={`doc-row ${active ? 'active' : ''}`} onClick={onClick}>
       <span className="doc-icon">{note.icon}</span>
       <span>
-        <strong>{note.title || 'Untitled Page'}</strong>
+        <strong>
+          <HighlightText value={note.title || 'Untitled Page'} query={query} />
+        </strong>
         <span className="doc-meta">
-          {note.folder} {note.tags.length ? `- ${note.tags.join(', ')}` : ''}
+          <HighlightText value={`${note.folder}${tags.length ? ` - ${tags.join(', ')}` : ''}`} query={query} />
         </span>
       </span>
     </button>
+  )
+}
+
+function HighlightText({ value, query }: { value: string; query: string }) {
+  const needle = query.trim()
+
+  if (!needle) {
+    return value
+  }
+
+  const index = value.toLowerCase().indexOf(needle.toLowerCase())
+
+  if (index < 0) {
+    return value
+  }
+
+  return (
+    <>
+      {value.slice(0, index)}
+      <mark>{value.slice(index, index + needle.length)}</mark>
+      {value.slice(index + needle.length)}
+    </>
   )
 }
 
@@ -1060,21 +1450,25 @@ function BlockEditor({
   block,
   readonly,
   dragged,
+  showSlashMenu,
   onDragStart,
   onDragOver,
   onDragEnd,
   onChange,
   onContentChange,
+  onConvert,
   onDelete,
 }: {
   block: NoteBlock
   readonly: boolean
   dragged: boolean
+  showSlashMenu: boolean
   onDragStart: () => void
   onDragOver: (event: DragEvent<HTMLDivElement>) => void
   onDragEnd: () => void
   onChange: (patch: Partial<NoteBlock>) => void
   onContentChange: (content: string) => void
+  onConvert: (type: BlockType) => void
   onDelete: () => void
 }) {
   const contentField = (
@@ -1114,6 +1508,17 @@ function BlockEditor({
         </label>
       ) : (
         contentField
+      )}
+
+      {showSlashMenu && !readonly && (
+        <div className="slash-menu">
+          {(['paragraph', 'heading', 'todo', 'quote'] as BlockType[]).map((type) => (
+            <button key={type} type="button" onClick={() => onConvert(type)}>
+              {blockIcons[type]}
+              <span>{blockLabels[type]}</span>
+            </button>
+          ))}
+        </div>
       )}
 
       {!readonly && (
