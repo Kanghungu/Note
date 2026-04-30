@@ -52,6 +52,7 @@ import {
 import { getSupabaseClient, isSupabaseConfigured, type RemoteNoteRow } from '@/lib/supabase'
 
 const STORAGE_KEY = 'note-atelier-documents-v2'
+const DEFAULT_APP_ORIGIN = 'https://note-sigma-jet.vercel.app'
 
 type SyncState = 'local' | 'ready' | 'syncing' | 'synced' | 'error'
 
@@ -163,6 +164,39 @@ function shareUrlFor(noteId: string) {
   }
 
   return `${window.location.origin}/share/${noteId}`
+}
+
+function normalizeOrigin(value: string | undefined) {
+  if (!value?.trim()) {
+    return null
+  }
+
+  try {
+    return new URL(value).origin
+  } catch {
+    return null
+  }
+}
+
+function getLoginRedirectTo() {
+  const configuredOrigin = normalizeOrigin(
+    process.env.NEXT_PUBLIC_SITE_URL || process.env.NEXT_PUBLIC_APP_URL,
+  )
+
+  if (configuredOrigin) {
+    return configuredOrigin
+  }
+
+  if (typeof window !== 'undefined') {
+    const { hostname, origin } = window.location
+    const localHosts = new Set(['localhost', '127.0.0.1', '0.0.0.0'])
+
+    if (!localHosts.has(hostname)) {
+      return origin
+    }
+  }
+
+  return DEFAULT_APP_ORIGIN
 }
 
 export function NoteWorkspace({
@@ -498,7 +532,7 @@ export function NoteWorkspace({
     const { error } = await client.auth.signInWithOtp({
       email: email.trim(),
       options: {
-        emailRedirectTo: window.location.origin,
+        emailRedirectTo: getLoginRedirectTo(),
       },
     })
 
